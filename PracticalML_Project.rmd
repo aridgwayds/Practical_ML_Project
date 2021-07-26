@@ -1,0 +1,361 @@
+---
+title: "PracticalML_FinalProject"
+author: "AR"
+date: "7/26/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message=FALSE, cache=TRUE)
+```
+
+# Coursera Practical Machine Learning – Course Project
+A. Ridgway
+22 JULY 2021
+
+## Assignment
+
+This assignment is based on a study in which participants’ body motions were recorded by accelerometers as weight-lifting exercises were performed: [Wearable Computing: Accelerometers' Data Classification of Body Postures and Movements](http:/groupware.les.inf.puc-rio.br/har#ixzz4Tjul9wt2) by: Ugulino, W.; Cardador, D.; Vega, K.; Velloso, E.; Milidiu, R.; Fuks, H. Proceedings of 21st Brazilian Symposium on Artificial Intelligence. Advances in Artificial Intelligence - SBIA 2012. In: Lecture Notes in Computer Science. , pp. 52-61. Curitiba, PR: Springer Berlin / Heidelberg, 2012. ISBN 978-3-642-34458-9. DOI: 10.1007/978-3-642-34459-6_6.
+
+The participants performed exercises using 5 different techniques where technique A being perfect form and techniques B through E incorrect forms.  The goal of this assignment was to build a model for predicting the technique in which barbell lifts were performed based on data from accelerometers placed on the belt, forearm, arm, and dumbbell of 6 participants. 
+
+## Summary
+
+For this assignment, a model was built and tested using the following steps:
+
+- Basic data exploration of training data
+- Data Cleaning and Initial Subsets 
+- Feature Selection
+- Pre-processing Training Data
+- Partitioning Training Data: Test and Verify
+- Model Fitting
+- Model Testing: Predictions with Verify data
+
+The resulting model used a total of 18 predictors. The Random Forest regression and classification method was used with 7 cross-validation re-sampling iterations.   
+
+```{r environ}
+# Libraries Used
+library(dplyr)
+library(stringr)
+library(caret)
+library(data.table)
+library(lubridate)
+library(knitr);library(kableExtra)
+library(parallel)
+library(doParallel)
+```
+
+```{r functions}
+##Functions
+# Count NA or blank data (df = datatable containing NAs)
+dfNas<-function(df) {
+        resultNAs<-sapply(df,function(x) round(100*as.numeric(sum(is.na(x)|str_trim(x,side=c("both"))=="")/nrow(df)),2))
+        return(resultNAs)
+}
+# Create information table of variables (df = datatable to process)
+dfInfo<-function(df) {
+        NAs<-dfNas(df);dfCols<-colnames(df);dfTypes<-sapply(df,class);
+        dfnvals<-round(nrow(df)*(1-NAs/100),0)
+        dfResult<-data.frame(cbind(name=dfCols,type=dfTypes,pctNA=NAs,nvals=dfnvals),row.names = NULL)
+        dfResult$pctNA<-as.numeric(dfResult$pctNA);dfResult$nvals<-as.numeric(dfResult$nvals)
+        return(dfResult)
+}
+# Create table of descriptive stats of variables (df = datatable to summarize)
+dfStats<-function(df,meas){
+        nvars<-length(meas)
+        #df<-training
+        functs<-list(mm = function(x) round(mean(x,na.rm = TRUE),2),
+                     md = function(x) round(median(x, na.rm=TRUE),2),
+                     msd=function(x) round(sd(x,na.rm=TRUE),2),
+                     mx = function(x) round(max(x, na.rm=TRUE),2), 
+                     mi = function(x) round(min(x, na.rm=TRUE),2),
+                     munq = function(x) as.numeric(length(unique(x))),
+                     pctunq = function(x) as.numeric(round(100*length(unique(x))/length(x)),4))
+        res<-data.table(matrix(0,nvars,8))
+        colnames(res)<-c("name","mean","median","sd","max","min","unq","pctunq")
+        res$name<-meas
+        data<-df[,meas]
+        for (i in c(1:7)){
+                res[,i+1]<-apply(data,2,functs[[i]])
+        }
+        return(res)
+}
+
+```
+
+## Data Loading
+
+The training and testing data were downloaded as .csv files from the following links:
+
+* Training              <https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv>
+* Testing               <https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv>
+
+Data descriptions were referenced from: [Human Activity Recognition](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har)
+
+Download Code follows:
+
+```{r dataload}
+
+trainUrl<-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testUrl<-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+#download.file(trainUrl,"./data/plm-training.csv");
+#download.file(testUrl,"./data/plm-testing.csv")
+
+traindata<-read.csv("./data/plm-training.csv", header = TRUE, row.names = NULL);testdata<-read.csv("./data/plm-testing.csv",header = TRUE, row.names = NULL)
+
+obsTest<-nrow(testdata);obsTrain<-nrow(traindata) 
+ncolsTest<-ncol(testdata);ncolsTrain<-ncol(traindata)
+training<-traindata
+meas<-colnames(training)[8:159];
+nmeas<-length(meas)
+```
+
+## Data Exploration
+
+The training data contains `r obsTrain` observations of `r ncolsTrain` variables. The Classe variable, which is the response variable for modeling purposes, represents the manner in which the exercise was performed, the definitions from the study are:
+
+<img class=center src=./Classes.png height=150>
+
+The training data contains the following number of observations per Classe:
+
+```{r exp_classe}
+kable(table(training$classe),col.names = c("Classe","Row Count")) %>% kable_styling(full_width = F,font_size=11,position = "center")
+
+```
+
+The identifier variables are:
+
+```{r exp_ids}
+print(names(training[,1:7]))
+```
+
+There are `r nmeas` accelerometer measures. The final feature set for the model development is a subset of these measures. The first 12 variables from the head of the data are shown below:
+
+```{r head}
+kable(traindata[1:5,1:11],format.args = list(decimal.mark = ".", big.mark = ""),caption="Training Data Slice","html") %>% kable_styling(bootstrap_options=c("striped"),full_width = F,font_size=10,position = "float_left") %>% scroll_box(height="300px")
+```
+
+
+## Data Cleaning
+
+Data cleaning steps taken were to:
+
+1. Convert measure variables to numeric
+2. Identify measure variables with more than 80% NAs
+
+The initial data set, when imported into R, has the following data types for the measurement variables:
+numeric, integer, character. All measurement variables are converted to numeric format. 
+
+Data exploration shows that 100 of the measurement variables have more than 80% of the data missing (NA’s). The remaining measures are:
+
+```{r clean_dtime}
+# Transform 1: Convert raw timestamps to datetime
+training<-training %>% mutate(datetime_1=as_datetime(raw_timestamp_part_1),
+        datetime_2=as_datetime(raw_timestamp_part_1+dmicroseconds(raw_timestamp_part_2)))
+# Update identifier variables
+idcols<-c("user_name","datetime_1","datetime_2","num_window");response<-c("classe");cols<-c(idcols,response,meas)
+training<-training %>% select_at(cols)
+training$classe<-as.factor(training$classe)
+trainingDF<-dfInfo(training)
+print(as.character(trainingDF[trainingDF$pctNA<=80,1]))
+```
+
+A summary of the remaining measures is shown in the table below:
+
+```{r subset1}
+# Subset 1: remove variables where NAs > 80% and remove identifier cols
+colsexc<-as.character(trainingDF[trainingDF$pctNA>80,1]) #columns to include from training
+colsinc<-as.character(trainingDF[trainingDF$pctNA<=20,1]) #cols with > 20% NA
+training<- training %>% select_at(colsinc)
+# Transform 2: Convert all remaining measures to numeric
+meas<-meas[-which(meas %in% colsexc)]
+training[meas]<-lapply(training[meas],as.numeric)
+# Subset 2: remove identifier cols (datetime, num_window)
+training<-training[,c(response,meas)]
+# Display table Descriptive Stats
+stats<-arrange(dfStats(training,meas),-pctunq)
+kable(stats,format.args = list(decimal.mark = ".", big.mark = ""),col.names=c("Measure","Mean","Median","sd","Max",   "Min","Unique","Unique %"),caption="Training Data: Measurement Variables Stats","html") %>%                 kable_styling(bootstrap_options=c("striped"),full_width = F,font_size=11,position = "float_left") %>% scroll_box(height="300px")
+
+```
+
+## Feature Selection
+
+To select the features from the accelerometer measures for the model development, measure variables with little/no variance and less than 5% unique values are identified for removal. 
+
+```{r varies}
+# NZV: near zero variance or few values unique
+nzv <- nearZeroVar(training[,meas],freqCut=95/5,uniqueCut = 10,saveMetrics=TRUE, names=TRUE)
+nzv$name <- rownames(nzv)
+#print(nrow(nzv[nzv$zeroVar | nzv$nzv,]))
+nzvs<-as.character(nrow(nzv[nzv$zeroVar | nzv$nzv,]))
+```
+
+A total of `r nzvs` measurement variables meet both of the near zero variance criteria:
+
+- ratio of the most common value to the second most common value is greater than 19
+- percentage of distinct values out of the number of total values is less than 10%
+
+However, a number of measurement variables have less than **5%** unique values are:
+
+```{r unique}
+# Remove measures where pct unique <5% 
+pctunq5<-nzv[nzv$percentUnique<5,5];training<-training[,-which(colnames(training) %in% (pctunq5))] 
+meas<-names(training[,2:length(training)]); 
+print(pctunq5)
+```
+
+### Correlated Variables
+
+To avoid overfitting the models, correlated variables are identified for removal from the training data set. The Spearman method for measuring correlation is applied as the distribution of the variables is not assumed to be normal.
+
+```{r corr}
+corrs_s<-abs(cor(training[,meas],method="spearman"))
+corcols_s<-findCorrelation(corrs_s, cutoff = .8, exact = TRUE,names=TRUE,verbose=FALSE)
+
+if (length(corcols_s)>0) {
+        training<-training[,-which(colnames(training) %in% (corcols_s))] #only cols <20% NA, greater than 5% unique, and correlation <.8
+        meas<-names(training[,2:length(training)])
+}
+colremoved<-length(corcols_s)
+```
+
+The correlation results for the data shows `r colremoved` highly correlated (0.80) variable(s):
+```{r corr2}
+print(as.character(corcols_s))
+```
+
+Removing the highly correlated variables yields the resulting variables (features) for model development:
+```{r feat}
+print(as.character(meas))
+
+```
+
+## Pre-processing
+
+The training data measures vary in the types of measurement units. To normalize the data, the training data are centered and scaled. A histogram and box plot of pitch_forearem normalized values are shown below:
+
+```{r prep}
+res<-as.data.frame(scale(training[,meas],center=TRUE,scale=TRUE))
+training<-res %>% mutate(classe=as.factor(training$classe)) #scaled/centered dataset
+histplot<-ggplot(training,aes(x=pitch_forearm))+geom_histogram(color="black",fill="skyblue",linetype=1,size=0.5,binwidth=1) +geom_vline(xintercept=0,color="red",linetype=1,size=1)+labs(title="Training Data: Pitch_ForeArm Measurement - Centered and Scaled")
+print(histplot)
+print(ggplot(training,aes(classe,pitch_forearm)) + geom_boxplot(aes(color=classe))+labs(title="Training Data: Pitch_ForeArm Measurement - Centered and Scaled"))
+
+```
+
+## Data Partitioning
+
+Since there are `r obsTrain`, this data set can be partitioned into a train set and a verify set. The proportion of 80% train and 20% verify is used. 
+
+```{r part}
+set.seed(12345)
+partdata<-createDataPartition(y=training$classe,p=.8,list=FALSE)
+train<-training[partdata,];verif<-training[-partdata,]
+obsTrainPart<-length(train);obsVerifyPart<-length(verif);
+```
+
+The train data set contains `r obsTrainPart` observations and the verify data set contains `r obsVerifyPart` observations. The **Classe** values are distributed as follows in the train data partition:
+
+```{r trainpart}
+kable(table(train$classe),col.names = c("Classe","Row Count"),caption="Train Partition","html") %>% kable_styling(full_width = F,font_size=11,position = "center")
+
+```
+
+In the verify data partition, the **Classe** values are distributed as:
+
+```{r verifypart}
+
+kable(table(verif$classe),col.names = c("Classe","Row Count"),caption="Verify Partition","html") %>% kable_styling(full_width = F,font_size=11,position = "center")
+
+```
+
+## Model Development
+
+Since the response variable for this project is a character-factor, the random forest classification model will be used for the initial model development. Depending the results of the predictions, another model may be evaluate if necessary. 
+Cross validation was set at 5, 7, and 10 resampling iterations. To shorten processing time, parallel processing was used, see the code snippet below for the specification of the model fitting method (caret package, train method):
+
+```{r model}
+
+#Start Cluster
+cluster <- makeCluster(detectCores() - 2) # left 2 cores available
+registerDoParallel(cluster)
+
+# Fit RF model with Cross validation resampling 5,7,10
+set.seed(2345)
+modFit5<-train(classe~.,method="rf",data = train,trainctr=trainControl(method="cv",number=5,allowParallel=TRUE)) 
+modFit7<-train(classe~.,method="rf",data = train,trainctr=trainControl(method="cv",number=7,allowParallel=TRUE))
+modFit10<-train(classe~.,method="rf",data = train,trainctr=trainControl(method="cv",number=10,allowParallel=TRUE)) 
+
+# Stop Processing Cluster
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+### Random Forest Model Results
+
+The results for the 3 models showed that 7 resampling iterations (mod7cv) resulted in the lowest expected error rate (OOB estimate of error rate):
+
+```{r results}
+res<-data.frame(model=c("RF 5 ","RF 7 ","RF 10 "),Max_accuracy=c(max(modFit5$results$Accuracy),max(modFit7$results$Accuracy),max(modFit10$results$Accuracy)),
+                Max_kappa=c(max(modFit5$results$Kappa),max(modFit7$results$Kappa),max(modFit10$results$Kappa)),Mean_errate=c(mean(modFit5$finalModel$err.rate),mean(modFit7$finalModel$err.rate),mean(modFit10$finalModel$err.rate)))
+kable(res,col.names = c("Model","Max Accuracy","Max Kappa","Mean Error Rate"),caption="RF Models - Train Data: 5, 7, and 10 Resampling Iterations","html") %>% kable_styling(full_width = F,font_size=11,position = "center")
+
+```
+
+## Final Model
+
+```{r finalmod}
+print(modFit7$finalModel)
+```
+
+### Results
+
+The complete results the final model follow. Note the best results are for 10 variables sampled at each split (mtry = 10).
+
+```{r finalmodre}
+#print(modFit7$results)
+kable(modFit7$results,col.names = c("mtry","Accuracy","Kappa","Accuracy SD","Kappa SD"),caption="RF Model Final Results","html") %>% kable_styling(full_width = F,font_size=11,position = "center")
+
+```
+
+The accuracy of the model declines after 10 randomly selected predictors are used as shown in the graph below:
+
+```{r plot1}
+plot(modFit7, ylim=c(0.9,1),main="Accuracy vs. Number of Predictors")
+```
+
+### Variable Importance
+
+The top ten predictors listed by Overall importance in the model are:
+
+```{r varsimp}
+vars<-arrange(round(varImp(modFit7)$importance,2),-Overall)
+#print(top_n(vars,n=10))
+kable(top_n(vars,n=10),col.names = c("Importance"),caption="RF Model: Top 10 Vars Overall Importance","html") %>% kable_styling(full_width = F,font_size=11,position = "center")
+
+```
+
+## Testing the Model with Verify Data
+
+The verify data was used to test the model by predicting the Classe and comparing the predictions to the Classe variable in the data. The overall results are:
+
+```{r verify}
+## Prediction with Verify data set
+predictions<- predict(modFit7,newdata=verif)
+cmx<-confusionMatrix(predictions,verif$classe)
+print(cmx$overall)
+
+```
+
+### Predicted Classes from Model
+
+The detailed prediction results for the verify data are shown below. Note that predictions for Classe = A and Classe = E show the least number of incorrect classifications (less than 1%). 
+
+```{r verifypred}
+
+verif$predRight <- predictions==verif$classe
+respreds<-table(predictions,verif$classe)
+print(respreds)
+
+```
+
